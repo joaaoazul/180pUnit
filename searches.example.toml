@@ -1,0 +1,20 @@
+# Copia para searches.toml e ajusta.
+
+[settings]
+db_path = "achados.db"
+delay_seconds = 4.0      # pausa média entre pedidos (com jitter)
+max_pages = 5            # páginas por pesquisa
+
+[scoring]
+min_comparables = 5      # nº mínimo de anúncios comparáveis para calcular mediana
+
+[[search]]
+name = "Apartamentos Lisboa"
+source = "imovirtual"
+url = "https://www.imovirtual.com/pt/resultados/comprar/apartamento/lisboa"
+
+# Qualquer site que exponha JSON-LD (schema.org) nas páginas de listagem:
+# [[search]]
+# name = "Exemplo"
+# source = "jsonld"
+# url = "https://exemplo.pt/comprar/moradias/porto"
