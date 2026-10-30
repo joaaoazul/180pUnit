@@ -72,3 +72,22 @@ def test_stale_listing_bonus(tmp_path):
     db.upsert(mk(1, 100_000), seen_at=old)
     d = compute_deals(db)[0]
     assert d.score == 5 and "dias" in d.reasons[0]
+
+
+def test_evaluate_manual_spec(tmp_path):
+    from achados.scoring import evaluate
+    db = seeded(tmp_path)  # T2 Lisboa, 3750-4062 €/m²
+    spec = {"municipality": "Lisboa", "rooms": 2, "property_type": "apartamento",
+            "area_m2": 80.0, "price": 240_000.0}
+    ev = evaluate(db, spec)
+    assert ev.comparables == 6 and ev.scope == "Lisboa T2"
+    assert ev.discount > 0.2 and "ÓTIMO" in ev.verdict
+    assert ev.fair_low <= ev.fair_price <= ev.fair_high
+    assert "caro" in evaluate(db, {**spec, "price": 420_000.0}).verdict
+
+
+def test_evaluate_without_comparables(tmp_path):
+    from achados.scoring import evaluate
+    ev = evaluate(Database(str(tmp_path / "t.db")),
+                  {"municipality": "Faro", "area_m2": 50.0, "price": 100_000.0})
+    assert ev.median_ppm2 is None and "sem comparáveis" in ev.verdict

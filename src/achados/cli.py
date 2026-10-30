@@ -10,13 +10,15 @@ from pathlib import Path
 
 from .db import Database
 from .fetch import PoliteFetcher
-from .scoring import compute_deals
+from .scoring import compute_deals, evaluate
 from .scrape import run_all
 
 
-def _load(path: str) -> dict:
+def _load(path: str, required: bool = True) -> dict:
     p = Path(path)
     if not p.exists():
+        if not required:
+            return {}
         sys.exit(f"Config não encontrada: {path}\nCopia searches.example.toml para {path}.")
     return tomllib.loads(p.read_text(encoding="utf-8"))
 
@@ -61,6 +63,53 @@ def cmd_deals(args, cfg) -> int:
     return 0
 
 
+def _ask(label: str, cast=str, required: bool = True):
+    while True:
+        raw = input(f"{label}: ").strip()
+        if not raw and not required:
+            return None
+        try:
+            return cast(raw.replace(" ", "").replace(",", ".")) if cast is not str else raw
+        except ValueError:
+            print("  valor inválido")
+
+
+def cmd_check(args, cfg) -> int:
+    interactive = args.preco is None and args.area is None and args.concelho is None
+    if interactive:
+        print("Descreve o imóvel (Enter para saltar o que for opcional):")
+        args.concelho = _ask("Concelho (ex: Lisboa)")
+        args.distrito = _ask("Distrito", required=False)
+        args.tipo = _ask("Tipo (apartamento/moradia/terreno)", required=False) or "apartamento"
+        args.tipologia = _ask("Tipologia (nº quartos, T2 -> 2)", int, required=False)
+        args.area = _ask("Área útil (m²)", float)
+        args.preco = _ask("Preço pedido (€)", float)
+        args.descricao = _ask("Notas/descrição", required=False) or ""
+    missing = [n for n, v in (("--concelho", args.concelho), ("--area", args.area),
+                              ("--preco", args.preco)) if v is None]
+    if missing:
+        sys.exit("Faltam: " + ", ".join(missing) + " (ou corre sem argumentos para modo interativo)")
+    if args.area <= 0 or args.preco <= 0:
+        sys.exit("Área e preço têm de ser positivos.")
+
+    db = Database(cfg.get("settings", {}).get("db_path", "achados.db"))
+    spec = {"municipality": args.concelho, "district": args.distrito,
+            "rooms": args.tipologia, "property_type": args.tipo.lower(),
+            "transaction_type": "rent" if args.arrendar else "sale",
+            "area_m2": args.area, "price": args.preco, "description": args.descricao}
+    ev = evaluate(db, spec, cfg.get("scoring", {}).get("min_comparables", 5))
+    print(f"\nPreço pedido: {args.preco:,.0f} € · {args.area:g} m² · {ev.price_per_m2:,.0f} €/m²")
+    if ev.median_ppm2:
+        print(f"Mercado ({ev.scope}, {ev.comparables} comparáveis): mediana {ev.median_ppm2:,.0f} €/m²")
+        print(f"Preço justo estimado: {ev.fair_price:,.0f} € "
+              f"(intervalo típico {ev.fair_low:,.0f}–{ev.fair_high:,.0f} €)")
+        print(f"Diferença: {ev.discount:+.0%} face à mediana (positivo = mais barato)")
+    print(f"Veredito: {ev.verdict}")
+    for w in ev.warnings:
+        print(f"! {w}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="achados", description=__doc__)
     ap.add_argument("-c", "--config", default="searches.toml")
@@ -71,11 +120,20 @@ def main(argv: list[str] | None = None) -> int:
     d.add_argument("--min-score", type=float, default=30)
     d.add_argument("--limit", type=int, default=20)
     d.add_argument("--format", choices=["table", "csv", "json"], default="table")
+    c = sub.add_parser("check", help="avalia um imóvel que descreves (sem argumentos: interativo)")
+    c.add_argument("--concelho")
+    c.add_argument("--distrito")
+    c.add_argument("--tipo", default="apartamento", help="apartamento, moradia, terreno, ...")
+    c.add_argument("--tipologia", type=int, help="nº de quartos (T2 -> 2)")
+    c.add_argument("--area", type=float, help="área em m²")
+    c.add_argument("--preco", type=float, help="preço pedido em €")
+    c.add_argument("--descricao", default="")
+    c.add_argument("--arrendar", action="store_true", help="avaliar renda em vez de venda")
     args = ap.parse_args(argv)
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
                         format="%(levelname)s %(message)s")
-    cfg = _load(args.config)
-    return {"scrape": cmd_scrape, "deals": cmd_deals}[args.cmd](args, cfg)
+    cfg = _load(args.config, required=args.cmd != "check")
+    return {"scrape": cmd_scrape, "deals": cmd_deals, "check": cmd_check}[args.cmd](args, cfg)
 
 
 if __name__ == "__main__":

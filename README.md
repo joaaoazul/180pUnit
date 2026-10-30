@@ -14,6 +14,17 @@ achados deals --format csv > achados.csv
 pytest
 ```
 
+### Avaliar um imóvel à mão
+
+```bash
+achados check --concelho Lisboa --tipologia 2 --area 80 --preco 240000
+achados check          # sem argumentos: pergunta tudo interativamente
+```
+
+Compara €/m² com a mediana dos anúncios já recolhidos e devolve preço justo estimado,
+intervalo típico (percentis 25-75), diferença face ao mercado e um veredito. Precisa de
+dados: corre `achados scrape` antes. Opções: `--distrito`, `--tipo`, `--descricao`, `--arrendar`.
+
 ## Como é pontuado
 
 | Componente | Pontos | Como |

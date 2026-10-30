@@ -42,27 +42,48 @@ def _clamp(x: float, lo: float = 0.0, hi: float = 1.0) -> float:
     return max(lo, min(hi, x))
 
 
-def compute_deals(db: Database, min_comparables: int = 5,
-                  now: datetime | None = None) -> list[Deal]:
-    now = now or datetime.now(timezone.utc)
-    rows = [dict(r) for r in db.active_listings()]
+def _candidates(r: dict) -> list[tuple[tuple, str]]:
+    """Chaves de grupo, do mais específico para o mais genérico."""
+    base = (r["transaction_type"], r["property_type"])
+    out = []
+    if r["municipality"]:
+        if r["rooms"] is not None:
+            out.append(((*base, "m", r["municipality"], r["rooms"]),
+                        f"{r['municipality']} T{r['rooms']}"))
+        out.append(((*base, "m", r["municipality"], None), r["municipality"]))
+    if r["district"]:
+        out.append(((*base, "d", r["district"], None), r["district"]))
+    return out
 
-    # índices de €/m² por grupo
+
+def _build_groups(rows: list[dict]) -> dict[tuple, list[tuple[int, float]]]:
     groups: dict[tuple, list[tuple[int, float]]] = {}
     for i, r in enumerate(rows):
         if not (r["price"] and r["area_m2"]):
             continue
-        ppm2 = r["price"] / r["area_m2"]
-        base = (r["transaction_type"], r["property_type"])
-        keys = []
-        if r["municipality"]:
-            if r["rooms"] is not None:
-                keys.append((*base, "m", r["municipality"], r["rooms"]))
-            keys.append((*base, "m", r["municipality"], None))
-        if r["district"]:
-            keys.append((*base, "d", r["district"], None))
-        for k in keys:
-            groups.setdefault(k, []).append((i, ppm2))
+        for key, _ in _candidates(r):
+            groups.setdefault(key, []).append((i, r["price"] / r["area_m2"]))
+    return groups
+
+
+def _find_comparables(r: dict, groups: dict, min_comparables: int,
+                      exclude: int | None = None) -> tuple[list[float], str]:
+    """€/m² dos comparáveis do grupo mais específico com amostra suficiente."""
+    for key, label in _candidates(r):
+        comps = [p for j, p in groups.get(key, []) if j != exclude]
+        if len(comps) >= min_comparables:
+            med = statistics.median(comps)
+            comps = [p for p in comps if 0.3 * med <= p <= 3 * med]  # tira outliers
+            if len(comps) >= min_comparables:
+                return comps, label
+    return [], "-"
+
+
+def compute_deals(db: Database, min_comparables: int = 5,
+                  now: datetime | None = None) -> list[Deal]:
+    now = now or datetime.now(timezone.utc)
+    rows = [dict(r) for r in db.active_listings()]
+    groups = _build_groups(rows)
 
     deals: list[Deal] = []
     for i, r in enumerate(rows):
@@ -73,24 +94,9 @@ def compute_deals(db: Database, min_comparables: int = 5,
         n_comps, scope = 0, "-"
 
         if ppm2:
-            base = (r["transaction_type"], r["property_type"])
-            candidates = []
-            if r["municipality"]:
-                if r["rooms"] is not None:
-                    candidates.append(((*base, "m", r["municipality"], r["rooms"]),
-                                       f"{r['municipality']} T{r['rooms']}"))
-                candidates.append(((*base, "m", r["municipality"], None), r["municipality"]))
-            if r["district"]:
-                candidates.append(((*base, "d", r["district"], None), r["district"]))
-            for key, label in candidates:
-                comps = [p for j, p in groups.get(key, []) if j != i]
-                if len(comps) >= min_comparables:
-                    med = statistics.median(comps)
-                    comps = [p for p in comps if 0.3 * med <= p <= 3 * med]  # tira outliers
-                    if len(comps) >= min_comparables:
-                        median, n_comps, scope = statistics.median(comps), len(comps), label
-                        break
-            if median:
+            comps, scope = _find_comparables(r, groups, min_comparables, exclude=i)
+            if comps:
+                median, n_comps = statistics.median(comps), len(comps)
                 discount = 1 - ppm2 / median
 
         score = 0.0
@@ -128,3 +134,55 @@ def compute_deals(db: Database, min_comparables: int = 5,
                           n_comps, scope, reasons, warnings))
     deals.sort(key=lambda d: d.score, reverse=True)
     return deals
+
+
+@dataclass
+class Evaluation:
+    price_per_m2: float
+    comparables: int
+    scope: str
+    median_ppm2: float | None = None
+    discount: float | None = None
+    fair_price: float | None = None
+    fair_low: float | None = None  # percentil 25
+    fair_high: float | None = None  # percentil 75
+    verdict: str = ""
+    warnings: list[str] = field(default_factory=list)
+
+
+def _verdict(discount: float) -> str:
+    if discount > SUSPECT_DISCOUNT:
+        return "suspeito (barato demais — confirma os dados)"
+    if discount >= 0.20:
+        return "ÓTIMO negócio"
+    if discount >= 0.10:
+        return "bom negócio"
+    if discount >= -0.05:
+        return "preço de mercado"
+    if discount >= -0.15:
+        return "um pouco caro"
+    return "caro"
+
+
+def evaluate(db: Database, spec: dict, min_comparables: int = 5) -> Evaluation:
+    """Avalia um imóvel descrito à mão (municipality, rooms, area_m2, price, ...)."""
+    r = {"transaction_type": "sale", "property_type": None, "district": None,
+         "municipality": None, "rooms": None, "title": "", "description": "", **spec}
+    ppm2 = r["price"] / r["area_m2"]
+    rows = [dict(x) for x in db.active_listings()]
+    comps, scope = _find_comparables(r, _build_groups(rows), min_comparables)
+    ev = Evaluation(ppm2, len(comps), scope)
+    text = f"{r['title']} {r['description']}".lower()
+    risks = [k for k in RISK if k in text]
+    if risks:
+        ev.warnings.append("risco: " + ", ".join(sorted(set(risks))))
+    if not comps:
+        ev.verdict = "sem comparáveis suficientes (corre `achados scrape` ou baixa min_comparables)"
+        return ev
+    ev.median_ppm2 = statistics.median(comps)
+    q = statistics.quantiles(comps, n=4) if len(comps) >= 2 else [ev.median_ppm2] * 3
+    ev.fair_price = ev.median_ppm2 * r["area_m2"]
+    ev.fair_low, ev.fair_high = q[0] * r["area_m2"], q[2] * r["area_m2"]
+    ev.discount = 1 - ppm2 / ev.median_ppm2
+    ev.verdict = _verdict(ev.discount)
+    return ev
